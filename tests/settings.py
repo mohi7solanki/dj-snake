@@ -1,4 +1,4 @@
-SECRET_KEY = "DO_YOU_KNOW_GODS_OF_DEATH_LOVES_APPLE"
+SECRET_KEY = "DO_YOU_KNOW_GODS_OF_DEATH_LOVE_APPLE"
 
 DATABASES = {
     "default": {
@@ -10,6 +10,7 @@ DATABASES = {
 TIME_ZONE = "UTC"
 
 INSTALLED_APPS = [
+    "tests.testapp",
     "dj_snake",
 ]
 
