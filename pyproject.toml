@@ -11,7 +11,7 @@ Django = ">=2.2"
 [tool.poetry.dev-dependencies]
 pytest-django = "^4.5.2"
 pytest = "^6.2.5"
-coverage = "^6.2"
+coverage = {version = "^6.2", extras = ["toml"]}
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
@@ -24,3 +24,15 @@ addopts = """\
     --ds=tests.settings
     """
 django_find_project = false
+
+
+[tool.coverage.run]
+parallel = true
+branch = true
+source = ["dj_snake"]
+
+[tool.coverage.paths]
+source = ["src", ".tox/*/site-packages"]
+
+[tool.coverage.report]
+show_missing = true

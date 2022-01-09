@@ -1,4 +1,4 @@
-SECRET_KEY = "NOTASECRET"
+SECRET_KEY = "DO_YOU_KNOW_GODS_OF_DEATH_LOVES_APPLE"
 
 DATABASES = {
     "default": {
@@ -12,3 +12,5 @@ TIME_ZONE = "UTC"
 INSTALLED_APPS = [
     "dj_snake",
 ]
+
+USE_TZ = True
