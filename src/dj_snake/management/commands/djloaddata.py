@@ -23,7 +23,7 @@ def topological_sort(dependency_graph):
     """
     todo = dependency_graph.copy()
     while todo:
-        current = {node for node, deps in todo.items() if len(deps) == 0}
+        current = {node for node, deps in todo.items() if not deps}
 
         if not current:
             raise ValueError(f"Cyclic dependency in graph: {todo}")
@@ -33,9 +33,17 @@ def topological_sort(dependency_graph):
 
         # remove current from todo's nodes & dependencies
         todo = {
-            node: (dependencies - current) for node, dependencies in
-            todo.items() if node not in current
+            node: (dependencies - current)
+            for node, dependencies in todo.items()
+            if node not in current
         }
+
+
+def get_related_fields(model):
+    """Get OneToMany relations of given model"""
+    return [
+        field for field in model._meta.fields if isinstance(field, models.ForeignKey)
+    ]
 
 
 def build_model_dependecy_graph(model_classes):
@@ -43,23 +51,22 @@ def build_model_dependecy_graph(model_classes):
     Build a dependency graph of models by inspecting model's field references
     with other models
     """
-    def _get_relations(model):
-        dependant_models = set()
-        for field in model._meta.fields:
-            # Since OneToOneField is a sublass of ForeignKey
-            # we can avoid checking it separately
-            if isinstance(field, models.ForeignKey):
-                dependant_models.add(field.related_model)
-        return dependant_models
+
+    def _get_dependencies(model):
+        dependencies = set()
+        for field in get_related_fields(model):
+            if not field.null:
+                dependencies.add(field.related_model)
+        return dependencies
 
     graph = {}
 
     for model in model_classes:
-        dependant_models = _get_relations(model)
-        graph[model] = dependant_models
+        dependencies = _get_dependencies(model)
+        graph[model] = dependencies
         # make sure all of our dependencies are included in the graph
-        for dependant_model in dependant_models:
-            graph.setdefault(dependant_model, set())
+        for dependency in dependencies:
+            graph.setdefault(dependency, set())
     return graph
 
 
@@ -71,10 +78,13 @@ class Command(loaddata.Command):
 
     def load_label(self, fixture_label):
         """Load fixtures files for a given label."""
-        old_new_primary_key_map = defaultdict(dict)
+        self.old_new_primary_key_map = defaultdict(dict)
+        self.obj_with_nullable_fk = set()
 
         show_progress = self.verbosity >= 3
-        for fixture_file, fixture_dir, fixture_name in self.find_fixtures(fixture_label):
+        for fixture_file, fixture_dir, fixture_name in self.find_fixtures(
+            fixture_label
+        ):
             _, ser_fmt, cmp_fmt = self.parse_name(os.path.basename(fixture_file))
             open_method, mode = self.compression_formats[cmp_fmt]
             fixture = open_method(fixture_file, mode)
@@ -89,68 +99,68 @@ class Command(loaddata.Command):
                     )
 
                 objects = serializers.deserialize(
-                    ser_fmt, fixture, using=self.using, ignorenonexistent=self.ignore,
+                    ser_fmt,
+                    fixture,
+                    using=self.using,
+                    ignorenonexistent=self.ignore,
                     handle_forward_references=True,
                 )
 
                 model_to_object_mapping = group_objects_by_model(objects)
                 graph = build_model_dependecy_graph(model_to_object_mapping.keys())
-                topological_sorted_models = tuple(topological_sort(graph))
 
-                for model in topological_sorted_models:
-                    if model in model_to_object_mapping:
-                        related_fields = [
-                            field for field in model._meta.fields
-                            if isinstance(field, models.ForeignKey)
-                        ]
-                        for obj in model_to_object_mapping[model]:
-                            objects_in_fixture += 1
-                            if (
-                                obj.object._meta.app_config in self.excluded_apps
-                                or type(obj.object) in self.excluded_models
-                            ):
-                                continue
+                for model in topological_sort(graph):
+                    if model not in model_to_object_mapping:
+                        continue
+                    related_fields = get_related_fields(model)
+                    for obj in model_to_object_mapping[model]:
+                        objects_in_fixture += 1
+                        if self.save_obj(obj, model, related_fields):
+                            loaded_objects_in_fixture += 1
+                            if show_progress:
+                                self.stdout.write(
+                                    "\rProcessed %i object(s)."
+                                    % loaded_objects_in_fixture,
+                                    ending="",
+                                )
 
-                            if router.allow_migrate_model(self.using, obj.object.__class__):
-                                loaded_objects_in_fixture += 1
-                                self.models.add(obj.object.__class__)
-                                old_pk = obj.object.pk
-                                # set the primary key as None
-                                obj.object.pk = None
+                for obj in self.obj_with_nullable_fk:
+                    model = obj.object._meta.model
+                    nullable_related_fields = [
+                        field for field in get_related_fields(model) if field.null
+                    ]
+                    for field in nullable_related_fields:
 
-                                # set the new primkary of foreignkey/onetoone field references
-                                for field in related_fields:
-                                    field_old_pk = getattr(obj.object, field.attname)
-                                    field_new_pk = old_new_primary_key_map[field.related_model].get(field_old_pk)
-                                    setattr(obj.object, field.attname, field_new_pk)
+                        field_old_pk = getattr(obj.object, field.attname)
+                        field_new_pk = self.old_new_primary_key_map[
+                            field.related_model
+                        ].get(field_old_pk)
 
-                                try:
-                                    obj.save(using=self.using)
-                                    if show_progress:
-                                        self.stdout.write(
-                                            '\rProcessed %i object(s).' % loaded_objects_in_fixture,
-                                            ending=''
-                                        )
-                                # psycopg2 raises ValueError if data contains NULL chars.
-                                except (DatabaseError, IntegrityError, ValueError) as e:
-                                    e.args = ("Could not load %(app_label)s.%(object_name)s(pk=%(pk)s): %(error_msg)s" % {
-                                        'app_label': obj.object._meta.app_label,
-                                        'object_name': obj.object._meta.object_name,
-                                        'pk': old_pk,
-                                        'error_msg': e,
-                                    },)
-                                    raise
-                                old_new_primary_key_map[model][old_pk] = obj.object.pk
+                        setattr(obj.object, field.attname, field_new_pk)
+                        try:
+                            obj.save(using=self.using)
+                        # psycopg2 raises ValueError if data contains NULL chars.
+                        except (DatabaseError, IntegrityError, ValueError) as e:
+                            e.args = (
+                                "Could not load %(app_label)s.%(object_name)s(pk=%(pk)s): %(error_msg)s"
+                                % {
+                                    "app_label": obj.object._meta.app_label,
+                                    "object_name": obj.object._meta.object_name,
+                                    "pk": obj.object.pk,
+                                    "error_msg": e,
+                                },
+                            )
+                            raise
 
-                            if obj.deferred_fields:
-                                self.objs_with_deferred_fields.append(obj)
                 if objects and show_progress:
-                    self.stdout.write('')  # add a newline after progress indicator
+                    self.stdout.write("")  # add a newline after progress indicator
                 self.loaded_object_count += loaded_objects_in_fixture
                 self.fixture_object_count += objects_in_fixture
             except Exception as e:
                 if not isinstance(e, CommandError):
-                    e.args = ("Problem installing fixture '%s': %s" % (fixture_file, e),)
+                    e.args = (
+                        "Problem installing fixture '%s': %s" % (fixture_file, e),
+                    )
                 raise
             finally:
                 fixture.close()
@@ -160,5 +170,50 @@ class Command(loaddata.Command):
                 warnings.warn(
                     "No fixture data found for '%s'. (File format may be "
                     "invalid.)" % fixture_name,
-                    RuntimeWarning
+                    RuntimeWarning,
                 )
+
+    def save_obj(self, obj, model, related_fields):
+        if (
+            obj.object._meta.app_config in self.excluded_apps
+            or type(obj.object) in self.excluded_models
+        ):
+            return False
+        saved = False
+        if router.allow_migrate_model(self.using, obj.object.__class__):
+            saved = True
+            self.models.add(obj.object.__class__)
+            old_pk = obj.object.pk
+            # set the primary key as None
+            obj.object.pk = None
+
+            # set the new primkary of foreignkey/onetoone field references
+            for field in related_fields:
+                field_old_pk = getattr(obj.object, field.attname)
+                if field_old_pk and field.null:
+                    self.obj_with_nullable_fk.add(obj)
+                    continue  # avoid setting None value
+                field_new_pk = self.old_new_primary_key_map[field.related_model].get(
+                    field_old_pk
+                )
+                setattr(obj.object, field.attname, field_new_pk)
+
+            try:
+                obj.save(using=self.using)
+            # psycopg2 raises ValueError if data contains NULL chars.
+            except (DatabaseError, IntegrityError, ValueError) as e:
+                e.args = (
+                    "Could not load %(app_label)s.%(object_name)s(pk=%(pk)s): %(error_msg)s"
+                    % {
+                        "app_label": obj.object._meta.app_label,
+                        "object_name": obj.object._meta.object_name,
+                        "pk": old_pk,
+                        "error_msg": e,
+                    },
+                )
+                raise
+            self.old_new_primary_key_map[model][old_pk] = obj.object.pk
+
+        if obj.deferred_fields:
+            self.objs_with_deferred_fields.append(obj)
+        return saved
