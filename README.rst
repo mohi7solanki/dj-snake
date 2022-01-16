@@ -12,7 +12,6 @@ with the new data from the fixture(s)
 Using ``djloaddata`` to install fixture ensures that no existing rows will be touched and all the objects will only be inserted
 while preserving all the relations between model objects.
 
-Note: Currently ``djloaddata`` does not support circular or self-references but it will be added in the upcoming release.
 
 Requirements
 ============
