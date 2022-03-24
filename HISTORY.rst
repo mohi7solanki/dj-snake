@@ -2,6 +2,11 @@
 History
 =======
 
+1.1.2 (2022-03-25)
+------------------
+
+* Add `ignoreconflicting` flag to djloaddata command to ignore rows that fails with `IntegrityError`
+
 1.1.1 (2022-01-21)
 ------------------
 

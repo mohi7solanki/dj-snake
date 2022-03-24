@@ -4,6 +4,7 @@ from io import StringIO
 
 import pytest
 from django.core.management import call_command
+from django.db import IntegrityError, transaction
 
 from tests.testapp import models
 
@@ -102,3 +103,50 @@ def test_djloaddata_command_cyclic():
     third_person = models.Person.objects.get(name="Third person")
     assert second_person.friend == third_person
     assert third_person.friend == second_person
+
+
+@pytest.mark.django_db(transaction=True)
+def test_djloaddata_command_ignore_conflicting_arguement():
+    fixture_data = [
+        {
+            "model": "testapp.author",
+            "pk": 1,
+            "fields": {"name": "KR$NA", "favourite_publisher": 1},
+        },
+        {
+            "model": "testapp.book",
+            "pk": 1,
+            "fields": {"name": "KR$NA's Book", "author": 1},
+        },
+        {
+            "model": "testapp.publisher",
+            "pk": 1,
+            "fields": {"name": "Kalamkaar Youtube", "favourite_book": 1},
+        },
+    ]
+    assert models.Author.objects.count() == 0
+    with tempfile.NamedTemporaryFile(suffix=".json") as fixture:
+        fixture.write(json.dumps(fixture_data).encode("utf-8"))
+        fixture.seek(0)
+        call_command("djloaddata", fixture.name)
+        with pytest.raises(IntegrityError):
+            call_command("djloaddata", fixture.name)
+    author = models.Author.objects.get(name="KR$NA")
+    assert models.Book.objects.get(name="KR$NA's Book").author == author
+    fixture_data = [
+        {
+            "model": "testapp.author",
+            "pk": 1,
+            "fields": {"name": "KR$NA", "favourite_publisher": 1},
+        },
+        {
+            "model": "testapp.book",
+            "pk": 1,
+            "fields": {"name": "KR$NA and Karma's Book", "author": 1},
+        },
+    ]
+    with tempfile.NamedTemporaryFile(suffix=".json") as fixture:
+        fixture.write(json.dumps(fixture_data).encode("utf-8"))
+        fixture.seek(0)
+        call_command("djloaddata", fixture.name, ignoreconflicting=True)
+    assert models.Book.objects.get(name="KR$NA and Karma's Book").author == author

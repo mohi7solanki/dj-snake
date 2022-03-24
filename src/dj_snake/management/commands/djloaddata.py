@@ -3,9 +3,12 @@ import warnings
 from collections import defaultdict
 
 from django.core import serializers
-from django.core.management.base import CommandError
+from django.core.management.base import CommandError, CommandParser
 from django.core.management.commands import loaddata
-from django.db import DatabaseError, IntegrityError, models, router
+from django.core.management.utils import parse_apps_and_model_labels
+from django.db import (
+    DatabaseError, IntegrityError, connections, models, router, transaction
+)
 
 
 def group_objects_by_model(objects):
@@ -28,8 +31,7 @@ def topological_sort(dependency_graph):
         if not current:
             raise ValueError(f"Cyclic dependency in graph: {todo}")
 
-        for node in current:
-            yield node
+        yield from current
 
         # remove current from todo's nodes & dependencies
         todo = {
@@ -53,11 +55,9 @@ def build_model_dependecy_graph(model_classes):
     """
 
     def _get_dependencies(model):
-        dependencies = set()
-        for field in get_related_fields(model):
-            if not field.null:
-                dependencies.add(field.related_model)
-        return dependencies
+        return {
+            field.related_model for field in get_related_fields(model) if not field.null
+        }
 
     graph = {}
 
@@ -76,7 +76,38 @@ class Command(loaddata.Command):
         "and preserving the relationships among all the objects"
     )
 
-    def load_label(self, fixture_label):
+    def add_arguments(self, parser: CommandParser) -> None:
+        super().add_arguments(parser)
+        parser.add_argument(
+            "--ignoreconflicting",
+            "-ic",
+            action="store_true",
+            dest="ignore_conflicting",
+            help="Ignore rows that fails with IntegrityError.",
+        )
+
+    def handle(self, *fixture_labels, **options):
+        self.ignore = options["ignore"]
+        self.using = options["database"]
+        self.app_label = options["app_label"]
+        self.verbosity = options["verbosity"]
+        self.excluded_models, self.excluded_apps = parse_apps_and_model_labels(
+            options["exclude"]
+        )
+        self.format = options["format"]
+        self.ignore_conflicting = options["ignore_conflicting"]
+
+        with transaction.atomic(using=self.using):
+            self.loaddata(fixture_labels)
+
+        # Close the DB connection -- unless we're still in a transaction. This
+        # is required as a workaround for an edge case in MySQL: if the same
+        # connection is used to create tables, load data, and query, the query
+        # can return incorrect results. See Django #7572, MySQL #37735.
+        if transaction.get_autocommit(self.using):
+            connections[self.using].close()
+
+    def load_label(self, fixture_label: str) -> None:
         """Load fixtures files for a given label."""
         self.old_new_primary_key_map = defaultdict(dict)
         self.obj_with_nullable_fk = set()
@@ -187,7 +218,7 @@ class Command(loaddata.Command):
             # set the primary key as None
             obj.object.pk = None
 
-            # set the new primkary of foreignkey/onetoone field references
+            # set the new primary of foreignkey/onetoone field references
             for field in related_fields:
                 field_old_pk = getattr(obj.object, field.attname)
                 if field_old_pk and field.null:
@@ -198,20 +229,29 @@ class Command(loaddata.Command):
                 )
                 setattr(obj.object, field.attname, field_new_pk)
 
-            try:
-                obj.save(using=self.using)
-            # psycopg2 raises ValueError if data contains NULL chars.
-            except (DatabaseError, IntegrityError, ValueError) as e:
-                e.args = (
-                    "Could not load %(app_label)s.%(object_name)s(pk=%(pk)s): %(error_msg)s"
-                    % {
-                        "app_label": obj.object._meta.app_label,
-                        "object_name": obj.object._meta.object_name,
-                        "pk": old_pk,
-                        "error_msg": e,
-                    },
-                )
-                raise
+            @transaction.atomic
+            def _try_save(obj):
+                try:
+                    obj.save(using=self.using)
+                # psycopg2 raises ValueError if data contains NULL chars.
+                except (DatabaseError, IntegrityError, ValueError) as e:
+                    if isinstance(e, IntegrityError) and self.ignore_conflicting:
+                        # Ensure we save the same old primary key in the
+                        # old_new_primary_key_map dictionary
+                        obj.object.pk = old_pk
+                        return
+                    e.args = (
+                        "Could not load %(app_label)s.%(object_name)s(pk=%(pk)s): %(error_msg)s"
+                        % {
+                            "app_label": obj.object._meta.app_label,
+                            "object_name": obj.object._meta.object_name,
+                            "pk": old_pk,
+                            "error_msg": e,
+                        },
+                    )
+                    raise
+
+            _try_save(obj)
             self.old_new_primary_key_map[model][old_pk] = obj.object.pk
 
         if obj.deferred_fields:
